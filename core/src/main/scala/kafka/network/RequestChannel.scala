@@ -21,10 +21,12 @@ import java.net.InetAddress
 import java.nio.ByteBuffer
 import java.util.concurrent._
 import com.fasterxml.jackson.databind.JsonNode
+import com.sun.jmx.remote.internal.ArrayQueue
 import com.typesafe.scalalogging.Logger
 import com.yammer.metrics.core.Meter
 import kafka.network
 import kafka.server.KafkaConfig
+import kafka.utils.CoreUtils.inLock
 import kafka.utils.{Logging, NotNothing, Pool}
 import kafka.utils.Implicits._
 import org.apache.kafka.common.config.ConfigResource
@@ -39,6 +41,7 @@ import org.apache.kafka.common.utils.{Sanitizer, Time}
 import org.apache.kafka.server.metrics.KafkaMetricsGroup
 
 import java.util
+import java.util.concurrent.locks.ReentrantLock
 import scala.annotation.nowarn
 import scala.collection.mutable
 import scala.jdk.CollectionConverters._
@@ -350,12 +353,18 @@ class RequestChannel(val queueSize: Int,
 
   private val metricsGroup = new KafkaMetricsGroup(this.getClass)
 
-  private val requestQueue = new ArrayBlockingQueue[BaseRequest](queueSize)
+  private val queueLock = new ReentrantLock
+  private val queueNotEmpty = queueLock.newCondition()
+  private val queueNotFull = queueLock.newCondition()
+
+  private val requestQueue = new ArrayQueue[BaseRequest](queueSize)
+  private val callbackQueue = new ArrayQueue[BaseRequest](queueSize)
+
   private val processors = new ConcurrentHashMap[Int, Processor]()
   val requestQueueSizeMetricName = metricNamePrefix.concat(RequestQueueSizeMetric)
   val responseQueueSizeMetricName = metricNamePrefix.concat(ResponseQueueSizeMetric)
 
-  metricsGroup.newGauge(requestQueueSizeMetricName, () => requestQueue.size)
+  metricsGroup.newGauge(requestQueueSizeMetricName, () => inLock(queueLock) { requestQueue.size })
 
   metricsGroup.newGauge(responseQueueSizeMetricName, () => {
     processors.values.asScala.foldLeft(0) {(total, processor) =>
@@ -376,10 +385,28 @@ class RequestChannel(val queueSize: Int,
     metricsGroup.removeMetric(responseQueueSizeMetricName, Map(ProcessorMetricTag -> processorId.toString).asJava)
   }
 
+  /** Queue a request to the corresponding queue, potentially blocking if there no room */
+  def queueRequest(request: BaseRequest, queue: ArrayQueue[BaseRequest]): Unit = {
+    inLock(queueLock) {
+      // Wait until there is room in the queue.
+      while (queue.size == queueSize)
+        queueNotFull.await()
+
+      // We must have room now.
+      queue.add(request)
+
+      // Wake up anyone blocked getting a request from queue.
+      queueNotEmpty.signal()
+    }
+  }
+
   /** Send a request to be handled, potentially blocking until there is room in the queue for the request */
   def sendRequest(request: RequestChannel.Request): Unit = {
-    requestQueue.put(request)
+    queueRequest(request, requestQueue)
   }
+
+  /** Send a callback request to be handled, potentially blocking until there is room in the queue for the request */
+  // TODO: queueRequest(callback, callbackQueue)
 
   def closeConnection(
     request: RequestChannel.Request,
@@ -457,12 +484,32 @@ class RequestChannel(val queueSize: Int,
   }
 
   /** Get the next request or block until specified time has elapsed */
-  def receiveRequest(timeout: Long): RequestChannel.BaseRequest =
-    requestQueue.poll(timeout, TimeUnit.MILLISECONDS)
+  def receiveRequest(timeout: Long): RequestChannel.BaseRequest = {
+    var timeToWaitNanos = TimeUnit.MILLISECONDS.toNanos(timeout)
+    inLock(queueLock) {
+      // Wait until either requestQueue or callbackQueue has something.
+      while (requestQueue.size == 0 && callbackQueue.size == 0) {
+        if (timeToWaitNanos <= 0L) {
+          // Timeout expired and both queues are still empty.
+          return null
+        }
+        timeToWaitNanos = queueNotEmpty.awaitNanos(timeToWaitNanos)
+      }
 
-  /** Get the next request or block until there is one */
-  def receiveRequest(): RequestChannel.BaseRequest =
-    requestQueue.take()
+      // Prefer handling a callback over a new request -- the callback is a continuation
+      // of a request that has done its time in the request queue, so it should continue
+      // ASAP.
+      val request = if (callbackQueue.size > 0) {
+        callbackQueue.remove(0)
+      } else {
+        requestQueue.remove(0)
+      }
+
+      // Wake up anyone blocked on adding request to the queue.
+      queueNotFull.signal()
+      request
+    }
+  }
 
   def updateErrorMetrics(apiKey: ApiKeys, errors: collection.Map[Errors, Integer]): Unit = {
     errors.forKeyValue { (error, count) =>
@@ -471,7 +518,10 @@ class RequestChannel(val queueSize: Int,
   }
 
   def clear(): Unit = {
-    requestQueue.clear()
+    inLock(queueLock) {
+      requestQueue.clear()
+      callbackQueue.clear()
+    }
   }
 
   def shutdown(): Unit = {
@@ -479,7 +529,7 @@ class RequestChannel(val queueSize: Int,
     metrics.close()
   }
 
-  def sendShutdownRequest(): Unit = requestQueue.put(ShutdownRequest)
+  def sendShutdownRequest(): Unit = queueRequest(ShutdownRequest, callbackQueue)
 
 }
 
